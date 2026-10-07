@@ -1,4 +1,4 @@
-import math
+import os
 import re
 import subprocess
 import xml.etree.ElementTree as ET
@@ -8,17 +8,48 @@ from rich.console import Console
 from rich.table import Table
 
 
+def l1_by_pu():
+    topo = subprocess.run(
+        ["lstopo", "--of", "xml"], capture_output=True, text=True, check=True
+    ).stdout
+
+    by_pu = {}
+
+    def walk(obj):
+        if obj.get("type") == "L1Cache":
+            expected = {
+                "size_bytes": int(obj.get("cache_size")),
+                "line_size": int(obj.get("cache_linesize")),
+                "associativity": int(obj.get("cache_associativity")),
+            }
+            for pu in obj.iter("object"):
+                if pu.get("type") == "PU":
+                    by_pu[int(pu.get("os_index"))] = expected
+            return
+
+        for child in obj:
+            if child.tag == "object":
+                walk(child)
+
+    root = ET.fromstring(topo)
+    for child in root:
+        if child.tag == "object":
+            walk(child)
+
+    return by_pu
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--benchmark",
         default="l1info",
-        help="l1info binary to test (default: from PATH)",
+        help="benchmark binary to test (default: from PATH)",
     )
     parser.addoption(
         "--cpu",
         type=int,
         default=None,
-        help="validate only the L1d instance containing this PU",
+        help="validate only this CPU",
     )
     parser.addoption(
         "--runs",
@@ -43,68 +74,38 @@ def pytest_configure(config):
     if not 0 < ratio <= 100:
         raise pytest.UsageError("--success-ratio must be within (0, 100]")
 
-    instances = l1_instances()
+    by_pu = l1_by_pu()
+    cpus = sorted(os.sched_getaffinity(0))
+    targets = {c: dict(by_pu[c], cpu=c) for c in cpus if c in by_pu}
+    if not targets:
+        raise pytest.UsageError(
+            "no L1d instance in the lstopo topology covers "
+            f"the available CPUs {cpus}"
+        )
+
     cpu = config.getoption("--cpu")
     if cpu is not None:
-        instances = [i for i in instances if cpu in i["pus"]]
-        if not instances:
+        if cpu not in targets:
             raise pytest.UsageError(
-                f"CPU {cpu} belongs to no L1d instance "
-                "in the lstopo topology"
+                f"CPU {cpu} belongs to no L1d instance in the lstopo "
+                "topology, or is outside the affinity mask"
             )
+        targets = {cpu: targets[cpu]}
 
-    targets = [
-        dict(instance, cpu=cpu if cpu is not None else min(instance["pus"]))
-        for instance in instances
-    ]
-    config._l1_targets = {t["cpu"]: t for t in targets}
+    config._l1_targets = targets
 
 
-def _min_pass(config):
-    return math.ceil(
-        config.getoption("--success-ratio") / 100 * config.getoption("--runs")
+def describe(expected):
+    return (
+        f"size={expected['size_bytes']} B line={expected['line_size']} "
+        f"assoc={expected['associativity']}"
     )
 
 
-def l1_instances():
-    topo = subprocess.run(
-        ["lstopo", "--of", "xml"], capture_output=True, text=True, check=True
-    ).stdout
-    instances = []
-
-    def walk(obj, l2_group):
-        obj_type = obj.get("type")
-        if obj_type == "L2Cache":
-            l2_group = obj.get("gp_index")
-
-        if obj_type != "L1Cache":
-            for child in obj:
-                if child.tag == "object":
-                    walk(child, l2_group)
-            return
-
-        pus = [
-            int(pu.get("os_index"))
-            for pu in obj.iter("object")
-            if pu.get("type") == "PU"
-        ]
-        if pus:
-            instances.append(
-                {
-                    "pus": pus,
-                    "size": int(obj.get("cache_size")),
-                    "line": int(obj.get("cache_linesize")),
-                    "ways": int(obj.get("cache_associativity")),
-                    "l2_group": l2_group,
-                }
-            )
-
-    root = ET.fromstring(topo)
-    for child in root:
-        if child.tag == "object":
-            walk(child, None)
-
-    return sorted(instances, key=lambda e: e["pus"][0])
+def _min_pass(config):
+    return (
+        config.getoption("--success-ratio") / 100 * config.getoption("--runs")
+    )
 
 
 def pytest_generate_tests(metafunc):
@@ -124,10 +125,11 @@ def pytest_generate_tests(metafunc):
 def pytest_report_header(config):
     targets = getattr(config, "_l1_targets", {})
     runs = config.getoption("--runs")
+    expected = ", ".join(sorted({describe(t) for t in targets.values()}))
 
     return (
         f"l1info vs lstopo: {len(targets)} core(s) x {runs} run(s), "
-        f"need >= {_min_pass(config)}/{runs} "
+        f"expected {expected}, need >= {_min_pass(config)}/{runs} "
         f"({config.getoption('--success-ratio'):.1f}%) matching per core"
     )
 
@@ -184,15 +186,11 @@ def pytest_terminal_summary(terminalreporter):
     for cpu in sorted(stats):
         entry = stats[cpu]
         target = targets.get(cpu, {})
-        expected = (
-            f"{target.get('size', 0) // 1024} KiB/"
-            f"{target.get('line', '?')} B/{target.get('ways', '?')}-way"
-        )
         passed = entry["good"] >= min_pass
 
         table.add_row(
             str(cpu),
-            expected,
+            describe(target) if target else "?",
             f"{entry['good']}/{entry['total']} (need >= {min_pass})",
             "[green]PASS[/]" if passed else "[bold red]FAIL[/]",
         )

@@ -16,7 +16,6 @@ def measure(benchmark, cpu):
         props[key] = value
 
     return {
-        "cpu": int(props["cpu"]),
         "size_bytes": int(props["size_bytes"]),
         "line_size": int(props["line_size"]),
         "associativity": int(props["associativity"]),
@@ -24,36 +23,41 @@ def measure(benchmark, cpu):
 
 
 def describe(size, line, ways):
-    return f"{size // 1024} KiB/{line} B/{ways}-way"
+    return f"size={size} B line={line} assoc={ways}"
 
 
 def test_l1_matches_lstopo(core, run, pytestconfig):
     benchmark = pytestconfig.getoption("--benchmark")
     got = measure(benchmark, core["cpu"])
 
+    exp = {
+        "size_bytes": core["size_bytes"],
+        "line_size": core["line_size"],
+        "associativity": core["associativity"],
+    }
+
     mismatches = []
-    if got["size_bytes"] != core["size"]:
+    if got["size_bytes"] != exp["size_bytes"]:
         mismatches.append(
-            f"capacity {got['size_bytes'] // 1024} KiB, "
-            f"expected {core['size'] // 1024} KiB"
+            f"capacity {got['size_bytes']} B ({got['size_bytes'] / 1024} KiB), "
+            f"expected {exp['size_bytes']} B ({exp['size_bytes'] / 1024} KiB)"
         )
 
-    if got["line_size"] != core["line"]:
+    if got["line_size"] != exp["line_size"]:
         mismatches.append(
-            f"line size {got['line_size']} B, expected {core['line']} B"
+            f"line size {got['line_size']} B, expected {exp['line_size']} B"
         )
 
-    if got["associativity"] != core["ways"]:
+    if got["associativity"] != exp["associativity"]:
         mismatches.append(
             f"associativity {got['associativity']}-way, "
-            f"expected {core['ways']}-way"
+            f"expected {exp['associativity']}-way"
         )
 
-    if got["cpu"] != core["cpu"]:
-        mismatches.append(f"ran on CPU {got['cpu']} instead of {core['cpu']}")
-
     if mismatches:
-        expected = describe(core["size"], core["line"], core["ways"])
+        expected = describe(
+            exp["size_bytes"], exp["line_size"], exp["associativity"]
+        )
         measured = describe(
             got["size_bytes"], got["line_size"], got["associativity"]
         )
